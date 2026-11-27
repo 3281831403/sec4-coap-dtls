@@ -1,4 +1,11 @@
-"""Validation helpers for CoAP commands carried over a DTLS session."""
+"""Validation helpers for CoAP commands carried over a DTLS session.
+
+A command is only executed when the session is established, the peer matches
+the session identity, the command is allowed by its scope, the message is
+inside the policy time window and its sequence number has not been executed
+before.  Sequence numbers wrap around ``seq_modulus``, so replay detection is
+performed on the wrapped value while execution state is kept per session.
+"""
 
 import json
 
@@ -64,6 +71,18 @@ def _policy(store):
     return policy if isinstance(policy, dict) else {}
 
 
+def _seq_modulus(store):
+    modulus = _as_int(_policy(store).get("seq_modulus", DEFAULT_SEQ_MODULUS))
+    if modulus is None or modulus <= 0:
+        modulus = DEFAULT_SEQ_MODULUS
+    return modulus
+
+
+def _seq_key(store, seq):
+    """Normalize a sequence number onto the configured wrap period."""
+    return seq % _seq_modulus(store)
+
+
 def _seen_for(store, sid):
     seen_map = store.setdefault("seen", {})
     if not isinstance(seen_map, dict):
@@ -77,7 +96,7 @@ def _seen_for(store, sid):
 
 
 def _remember(store, sid, seq):
-    _seen_for(store, sid).add(seq)
+    _seen_for(store, sid).add(_seq_key(store, seq))
     last_map = store.setdefault("last_seq", {})
     if not isinstance(last_map, dict):
         last_map = {}
@@ -100,7 +119,8 @@ def parse_message(raw):
     """Normalize a raw CoAP command message.
 
     The message must provide session, peer, seq, ts, cmd and scope. Numeric
-    fields may be supplied as numbers or decimal strings.
+    fields may be supplied as numbers or decimal strings.  Unrecognised keys
+    are ignored.
     """
     if isinstance(raw, (bytes, bytearray)):
         try:
@@ -121,7 +141,7 @@ def parse_message(raw):
     seq = _as_int(raw.get("seq"))
     ts = _as_number(raw.get("ts"))
     scope = _as_text(raw.get("scope"))
-    command = _as_text(raw.get("cmd")) or "status"
+    command = _as_text(raw.get("cmd"))
 
     if session is None:
         raise ValueError("session is required")
@@ -131,6 +151,8 @@ def parse_message(raw):
         raise ValueError("seq must be a non-negative integer")
     if ts is None:
         raise ValueError("ts must be a number")
+    if command is None:
+        raise ValueError("cmd is required")
     if scope is None:
         raise ValueError("scope is required")
 
@@ -145,39 +167,48 @@ def parse_message(raw):
 
 
 def check_session(session, store):
-    """Return True when the session is present in the session store."""
+    """Return True when the session exists and is established."""
     if not isinstance(store, dict):
         return False
     record = _session_record(store, session)
-    return record is not None
+    if record is None:
+        return False
+    return bool(record.get("established", False))
 
 
 def check_peer(msg, session):
-    """Return True when the message and session expose peer identities."""
+    """Return True when the message peer matches the session peer."""
     if not isinstance(msg, dict) or not isinstance(session, dict):
         return False
     expected = _as_text(session.get("peer"))
     presented = _as_text(msg.get("peer"))
-    return expected is not None and presented is not None
+    if expected is None or presented is None:
+        return False
+    return expected == presented
 
 
 def check_replay(store, session, seq):
-    """Return True when a sequence number is available for execution."""
+    """Return True when the sequence number has not been executed yet.
+
+    Deduplication is per session and follows the sequence wrap period, so a
+    replayed message is rejected whatever timestamp it carries.
+    """
     if not isinstance(store, dict):
         return False
     sid = _session_id(session)
     item = _as_int(seq)
     if sid is None or item is None or item < 0:
         return False
-    last_map = store.get("last_seq", {})
-    last = _as_int(last_map.get(sid)) if isinstance(last_map, dict) else None
-    if last is not None and item < last:
-        return False
+    key = _seq_key(store, item)
+    for value in _seen_for(store, sid):
+        existing = _as_int(value)
+        if existing is not None and existing >= 0 and _seq_key(store, existing) == key:
+            return False
     return True
 
 
 def check_window(msg, now, policy):
-    """Return True when the message timestamp falls inside the time window."""
+    """Return True when ts falls inside the inclusive window around now."""
     if not isinstance(msg, dict) or not isinstance(policy, dict):
         return False
     ts = _as_number(msg.get("ts"))
@@ -185,22 +216,35 @@ def check_window(msg, now, policy):
     window = _as_number(policy.get("window", 0))
     if ts is None or base is None or window is None or window < 0:
         return False
-    if window == 0:
-        return True
-    return ts <= base + window
+    return abs(ts - base) <= window
 
 
 def check_scope(cmd, policy):
-    """Return True when a command carries a name and a scope."""
-    if not isinstance(cmd, dict):
+    """Return True when the command name is allowed by its scope."""
+    if not isinstance(cmd, dict) or not isinstance(policy, dict):
         return False
     name = _as_text(cmd.get("name"))
     scope = _as_text(cmd.get("scope"))
-    return name is not None and scope is not None
+    if name is None or scope is None:
+        return False
+    scopes = policy.get("scopes")
+    if not isinstance(scopes, dict):
+        return False
+    allowed = scopes.get(scope)
+    if isinstance(allowed, str):
+        allowed = {allowed}
+    if not isinstance(allowed, (set, frozenset, list, tuple)):
+        return False
+    return name in allowed
 
 
 def handle(msg, store, now):
     """Validate, execute and record one CoAP command message."""
+    if isinstance(msg, (str, bytes, bytearray)):
+        try:
+            msg = parse_message(msg)
+        except ValueError:
+            return _failure("message")
     if not isinstance(msg, dict):
         return _failure("message")
     if not isinstance(store, dict):
@@ -216,17 +260,18 @@ def handle(msg, store, now):
 
     seq = _as_int(msg.get("seq"))
     ts = _as_number(msg.get("ts"))
-    if seq is None or seq < 0:
-        return _failure("message", sid, seq)
-    if ts is None:
+    command = _as_text(msg.get("cmd"))
+    scope = _as_text(msg.get("scope"))
+    if seq is None or seq < 0 or ts is None or command is None or scope is None:
         return _failure("message", sid, seq)
 
-    command = _as_text(msg.get("cmd")) or "status"
-    scope = _as_text(msg.get("scope"))
     policy = _policy(store)
 
     if not check_scope({"name": command, "scope": scope}, policy):
         return _failure("scope", sid, seq, command)
+
+    if not check_window({"ts": ts}, now, policy):
+        return _failure("window", sid, seq, command)
 
     if not check_replay(store, sid, seq):
         return _failure("replay", sid, seq, command)
@@ -239,7 +284,11 @@ def handle(msg, store, now):
         "cmd": command,
         "scope": scope,
     }
-    store.setdefault("executed", []).append(record)
+    executed = store.get("executed")
+    if not isinstance(executed, list):
+        executed = []
+        store["executed"] = executed
+    executed.append(record)
     _remember(store, sid, seq)
 
     return {
@@ -254,20 +303,19 @@ def handle(msg, store, now):
 
 
 def coap_batch(messages, store, now):
-    """Process a batch of CoAP messages and return per-message results."""
-    items = list(messages) if messages is not None else []
-    results = []
-    active_session = None
+    """Process a batch of CoAP messages, keeping per-device state separate."""
+    if messages is None:
+        items = []
+    elif isinstance(messages, dict):
+        items = [messages]
+    elif isinstance(messages, (str, bytes, bytearray)):
+        items = [messages]
+    else:
+        items = list(messages)
 
+    results = []
     for item in items:
-        if isinstance(item, dict):
-            if active_session is None:
-                active_session = _session_id(item.get("session"))
-            effective = dict(item)
-            effective["session"] = active_session
-        else:
-            effective = item
-        results.append(handle(effective, store, now))
+        results.append(handle(item, store, now))
 
     executed = sum(1 for result in results if result.get("executed"))
     return {
